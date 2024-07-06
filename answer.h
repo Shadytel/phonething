@@ -1,39 +1,6 @@
-/**********@@@SOFT@@@WARE@@@COPY@@@RIGHT@@@**********************************
-* DIALOGIC CONFIDENTIAL
-*
-* Copyright (C) 1990-2007 Dialogic Corporation. All Rights Reserved.
-* The source code contained or described herein and all documents related
-* to the source code ("Material") are owned by Dialogic Corporation or its
-* suppliers or licensors. Title to the Material remains with Dialogic Corporation
-* or its suppliers and licensors. The Material contains trade secrets and
-* proprietary and confidential information of Dialogic or its suppliers and
-* licensors. The Material is protected by worldwide copyright and trade secret
-* laws and treaty provisions. No part of the Material may be used, copied,
-* reproduced, modified, published, uploaded, posted, transmitted, distributed,
-* or disclosed in any way without Dialogic's prior express written permission.
-*
-* No license under any patent, copyright, trade secret or other intellectual
-* property right is granted to or conferred upon you by disclosure or delivery
-* of the Materials, either expressly, by implication, inducement, estoppel or
-* otherwise. Any license under such intellectual property rights must be
-* express and approved by Dialogic in writing.
-*
-***********************************@@@SOFT@@@WARE@@@COPY@@@RIGHT@@@**********/
-/*********************************************************************
-*                                                                   *
-*    AA    N    N   SSSS   W    W  EEEEEE  RRRRR           H    H   *
-*   A  A   NN   N  S       W    W  E       R    R          H    H   *
-*  A    A  N N  N   SSSS   W    W  EEEEE   R    R          HHHHHH   *
-*  AAAAAA  N  N N       S  W WW W  E       RRRRR    ...    H    H   *
-*  A    A  N   NN  S    S  WW  WW  E       R   R    ...    H    H   *
-*  A    A  N    N   SSSS   W    W  EEEEEE  R    R   ...    H    H   *
-*                                                                   *
-*********************************************************************/
-
 /**
  ** Definitions
  **/
-#define MAXDTMF     4   /* Number of Digits Expected        */
 #define MAXCHANS    96  /* Maximum Number of Channels       */
 #define MAXRING     2   /* Number of Rings Before Picking Up    */
 #define MAXMSG      260 /* Maximum Length of Message Filename. So, *so* wasteful... */
