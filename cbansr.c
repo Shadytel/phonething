@@ -74,7 +74,6 @@
 #include <sqlite3.h>
 
 
-#define PRINTON
 #include "sctools.h"
 
 #include "answer.h"
@@ -95,7 +94,6 @@ typedef long int (*EVTHDLRTYP)();
 /*
  * File Descriptors for VOX Files
  */
-int introfd;
 //int invalidfd;
 int goodbyefd;
 //int errorfd;
@@ -123,7 +121,7 @@ static char bookmark[ MAXCHANS + 1 ][ 5 ];
 static unsigned char errcnt[ MAXCHANS + 1 ]; /* Error counter */
 static unsigned char ownies[ MAXCHANS + 1 ];
 static unsigned char termmask[ MAXCHANS + 1] = {0}; // By popular request, a bitmask to tell the software how to clean up the call!
-static unsigned char filecount[ MAXCHANS + 1 ];
+static unsigned short filecount[ MAXCHANS + 1 ];
 static char filerrcnt[ MAXCHANS + 1 ];
 //static char filetmp[ MAXCHANS + 1 ][ MAXMSG + 1 ];
 //static char filetmp2[ MAXCHANS + 1 ][ MAXMSG + 1 ];
@@ -152,7 +150,7 @@ static int file[25]; // For readback function.
 
 static struct channel_info {
     struct {
-        bool using_list;  
+        bool using_list;
     } dialer;
 } chaninfo[MAXCHANS + 1];
 
@@ -229,6 +227,7 @@ int endwin(void);
 bool routed_cleanup(short channum);
 void file_error(short channum, char *file_name);
 short get_channum_ts(long sctimeslot);
+void isdn_close(int maxchan);
 
 // SQL callback function declarations
 
@@ -236,6 +235,7 @@ int userpass_cb(void * chanptr, int argc, char **argv, char **coldata);
 int count_cb(void * chanptr, int argc, char **argv, char **coldata);
 int admincount_cb(void * chanptr, int argc, char **argv, char **coldata);
 int adminadd_cb(void * chanptr, int argc, char **argv, char **coldata);
+int npa_cb(void * chanptr, int argc, char **argv, char **coldata);
 /*
  * Externals
  */
@@ -797,10 +797,6 @@ bool dropfromconf(short channum, unsigned char confnum) {
     tsinfo.sc_tsarrayp = &scts;
 
     participants[confnum]--;
-    if (participants[confnum] < 0) {
-        disp_msg("WARNING: Conference participants went below zero! Correcting...");
-        participants[confnum] = 0;
-    }
 
     // If someone is just waiting for the conf, no need to tear it down or whatever
 
@@ -1656,11 +1652,6 @@ void end_app() {
         dcb_close(confbrd);
     }
 
-    if (altsig & 2) {
-        altsig = 0;
-        fclose(debugfile);
-        debugfile = NULL;
-    }
     /*
     if (dm3board == TRUE) {
         while (bdnum <= 2) {
@@ -1703,10 +1694,17 @@ void end_app() {
         dx_deltones(dxinfox[ channum ].chdev);   // Get rid of any remaining user-defined tones
         chstate = ATDX_STATE(dxinfox[ channum ].chdev);
         disp_msgf("Setting channel %i onhook. Currently in state %li", channum, chstate);
+        if (chstate != CS_IDLE) {
+            dxinfox[ channum ].state = ST_GOODBYE;
+            dx_stopch(dxinfox[ channum ].chdev, EV_SYNC);
+        }
         set_hkstate(channum, DX_ONHOOK);
         disp_msg("Exiting set_hkstate");
+        if (frontend == CT_GCISDN) {
+            isdn_close(channum);
+        }
 
-        if (frontend == CT_NTANALOG) {
+        else if (frontend == CT_NTANALOG) {
             /*
              * If analog frontend timeslots had been routed to the resource,
              * then unroute them.
@@ -1742,12 +1740,17 @@ void end_app() {
     if (frontend == CT_GCISDN) {
         gc_Stop();
     }
+    if (altsig & 2) {
+        altsig = 0;
+        fclose(debugfile);
+        debugfile = NULL;
+    }
 
     close(invalidfd);
     close(errorfd);
-    close(introfd);
     close(goodbyefd);
     sqlite3_close(activationdb);
+    sqlite3_close(tc_blacklist);
 
     QUIT(0);
 }
@@ -2011,6 +2014,8 @@ int play(short channum, int filedesc, int format, unsigned long offset, char opt
 
     if (lseek(filedesc, offset, SEEK_SET) == -1) {
         disp_msgf("Seek operation failed on %s with offset %lu", ATDV_NAMEP(dxinfox[ channum ].chdev), offset);
+        dxinfox[ channum ].state = ST_GOODBYE;
+        if (play(channum, errorfd, 0, 0, 0) == -1) set_hkstate(channum, DX_ONHOOK);
         return (-1);
     }
 
@@ -2597,7 +2602,9 @@ int send_bell202(short channum, int filedesc) {
  *              0x1000 - Terminate collection upon receiving one particular digit.
  *                     If this is selected, the 4 LSBs indicates the digit in question.
  *                     E = *, F = #, ABCD are normal.
- *              0x2000 -
+ *              0x2000 - Terminate collection upon a bitmask received as the intermax
+ *                     argument. Only this and 0x1000 can be invoked at the same time.
+ *                     If found, an inter-digit time of 5 seconds will be used.
  *              0x4000 -
  *              0x8000 -
  *
@@ -2694,6 +2701,18 @@ int get_digs(short channum, DV_DIGIT *digbufp, unsigned short numdigs, unsigned 
         }
 
         tpt[ tptnum ].tp_flags  = TF_DIGMASK;
+        tptnum++;
+    }
+
+    else if (termflags & 0x2000) {
+        // Terminate on bitmask
+        tpt[ tptnum ].tp_type   = IO_CONT;
+        tpt[ tptnum ].tp_termno = DX_DIGMASK;
+        tpt[ tptnum ].tp_length = intermax;
+        tpt[ tptnum ].tp_flags = TF_DIGMASK;
+
+        // Set inter-digit timing to 5 seconds
+        intermax = 50;
         tptnum++;
     }
 
@@ -3540,6 +3559,20 @@ void tl_reroute(short channum)
         return;
     }
 
+void outcall_inroute(short channum) {
+    dxinfox[ channum ].state = ST_PLAYMULTI;
+    multiplay[channum][0] = open("sounds/tc24/tc_callout.pcm", O_RDONLY);
+    multiplay[channum][1] = open("sounds/tc24/tc_callout.pcm", O_RDONLY);
+    multiplay[channum][2] = open("sounds/tc24/tc_callout.pcm", O_RDONLY);
+
+    if (playmulti(channum, 3, 0, multiplay[channum]) == -1) {
+        disp_msg("Callout message passed bad data to the playmulti function.");
+        dxinfox[ channum ].state = ST_GOODBYE;
+        play(channum, goodbyefd, 0, 0, 0);
+    }
+    return;
+}
+
 
 char isdn_inroute(short channum) {
     // This is a new routine for inbound ISDN call routing. DNIS is retreived and
@@ -3559,6 +3592,29 @@ char isdn_inroute(short channum) {
         }
         fflush(calllog);
     }
+
+    if (strcmp("31337", isdninfo[ channum ].dnis) == 0) {
+            if (isdn_drop(channum, GC_USER_BUSY) == -1) {
+                set_hkstate(channum, DX_ONHOOK);
+            }
+            return (0);
+    }
+
+   if ( (strcmp(isdninfo[channum].dnis, config.extensions.telechallenge) == 0) ){
+         set_hkstate(channum, DX_OFFHOOK);
+         dx_clrdigbuf(dxinfox[channum].chdev);
+         dxinfox[ channum ].state = ST_TC24MENU;
+         // Zero this out, just in case.
+         memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+         errcnt[ channum ] = 0;
+         disp_status(channum, "Running Telechallenge IVR");
+         dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+         if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+             file_error( channum, "sounds/tc24/greeting.pcm" );
+             return -1;
+         }
+         return 0;
+   }
 
    if ( (strcmp(isdninfo[channum].dnis, config.extensions.phreakspots) == 0) ){
             srandom(time(NULL));
@@ -3583,6 +3639,7 @@ char isdn_inroute(short channum) {
             dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
             if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)  == -1) {
                 file_error(channum, dxinfox[ channum ].msg_name);
+                return -1;
             }
           return (0);
     }
@@ -3954,6 +4011,15 @@ char isdn_inroute(short channum) {
 
         set_hkstate(channum, DX_OFFHOOK);
 
+        // This'll be a one time only thing
+        if (strlen(isdninfo[channum].cpn) > 4) {
+            if ((strcmp("8134695930", isdninfo[channum].cpn) != 0) && (strcmp("18134695930", isdninfo[channum].cpn) != 0)) {
+                voicemail_xfer(channum, "1114");
+                return 0;
+            }
+
+        }
+
         if (termmask[ channum ] & 1) {
         //if ((ownies[channum] == 100) || (ownies[channum] == 200) ) {
             disp_msg("Removing custom tone with incoming call");
@@ -3965,6 +4031,11 @@ char isdn_inroute(short channum) {
         if (dx_blddt(TID_1, 1880, 15, 697, 15, TN_TRAILING) == -1) {
             disp_msg("Shit we couldn't build the Chucktone!");
         }
+
+        if (dx_addtone(dxinfox[channum].chdev, 'E', DG_USER1) == -1) {
+            disp_msgf("Unable to add Chucktone. %s", ATDV_ERRMSGP(dxinfox[channum].chdev));
+        }
+
 
         // srandom(time(NULL)); // Seed the random number generator for the thing
         disp_status(channum, "Accessing Voice BBS");
@@ -4041,7 +4112,7 @@ char isdn_inroute(short channum) {
     }
 
 
-    /*
+    
     if (strcmp(config.extensions.callintercept, isdninfo[ channum ].dnis) == 0) {
         // Execution of The Thing happens here.
         if ((strcmp("16312763409", isdninfo[ channum ].cpn) == 0) || (strcmp("6312763409", isdninfo[ channum ].cpn) == 0)) {
@@ -4061,7 +4132,7 @@ char isdn_inroute(short channum) {
         
         return(routecall( channum, 1, 23, config.interceptdest, isdninfo[channum].cpn, TRUE));
     }
-    */
+    
 
     if (strcmp(config.extensions.echotest, isdninfo[ channum ].dnis) == 0) {
 
@@ -6244,6 +6315,9 @@ int play_hdlr() {
                         disp_msg("Holy shit, rename failed. You should fix this.");
                     }
 
+                    // Added since we we were occasionally leaking file descriptors
+                    close(dxinfox[channum].msg_fd);
+
                     return (0);
                 }
 
@@ -6336,6 +6410,168 @@ int play_hdlr() {
 
             break;
 
+        case ST_ISDNNWN:
+            close(dxinfox[channum].msg_fd);
+            if (isdn_drop(channum, UNASSIGNED_NUMBER) == -1) {
+                set_hkstate(channum, DX_ONHOOK);
+            }
+            return 0;
+
+
+        case ST_TC24ARG:
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][0] = open(dxinfox[ channum ].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][1] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][2] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][3] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][4] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][5] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][6] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][7] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][8] = open(dxinfox[channum].msg_name, O_RDONLY);
+            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+            multiplay[channum][9] = open(dxinfox[channum].msg_name, O_RDONLY);
+            if (playmulti( channum, 10, 0x00, multiplay[channum]) == -1) {
+                unsigned char counter;
+                for (counter = 0; counter < 10; counter++) {
+                    close(multiplay[channum][counter]);
+                }
+                dxinfox[ channum ].state = ST_GOODBYE;
+                disp_msg("Couldn't play Riverito message!");
+                play(channum, errorfd, 0, 0, 0);
+                return -1;
+             }
+             return 0;
+
+        case ST_TC24CALLDB:
+            close(dxinfox[channum].msg_fd);
+        case ST_TC24CALLE:
+            if (errcnt[channum] > 2) {
+                memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                dxinfox[ channum ].state = ST_ONHOOK;
+                set_hkstate(channum, DX_ONHOOK);
+                return 0;
+            }
+            dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_enternum.pcm", O_RDONLY);
+            dxinfox[ channum ].state = ST_TC24CALL;
+            if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                file_error(channum, "sounds/tc24/tc_enternum.pcm");
+                return -1;
+            }
+            return 0;
+
+        case ST_TC24CALL2E:
+            if (errcnt[channum] > 2) {
+                memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                dxinfox[ channum ].state = ST_ONHOOK;
+                set_hkstate(channum, DX_ONHOOK);
+                return 0;
+            }
+            else {
+                // Read back for confirmation
+                //unsigned short length = strlen(dialout_prefix);
+                multiplay[channum][0] = open("sounds/tc24/challenging.pcm", O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][0]);
+                multiplay[channum][1] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][1]);
+                multiplay[channum][2] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][2]);
+                multiplay[channum][3] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][3]);
+                multiplay[channum][4] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][4]);
+                multiplay[channum][5] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][5]);
+                multiplay[channum][6] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][6]);
+                multiplay[channum][7] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][7]);
+                multiplay[channum][8] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][8]);
+                multiplay[channum][9] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", filetmp[channum][9]);
+                multiplay[channum][10] = open(dxinfox[channum].msg_name, O_RDONLY);
+                multiplay[channum][11] = open("sounds/tc24/right.pcm", O_RDONLY);
+                dxinfox[ channum ].state = ST_TC24CALL2;
+                if (playmulti( channum, 12, 0x80, multiplay[channum]) == -1) {
+                    unsigned char counter;
+                    for (counter = 0; counter < 12; counter++) {
+                        close(multiplay[channum][counter]);
+                    }
+                    dxinfox[ channum ].state = ST_GOODBYE;
+                    disp_msg("Couldn't play confirmation message!");
+                    play(channum, errorfd, 0, 0, 0);
+                    return -1;
+                }
+                return 0;
+            }
+
+        case ST_TC24CALL2:
+            get_digs(channum, &dxinfox[ channum ].digbuf, 1, 50, 0x200);
+            return 0;
+
+        case ST_TC24CALL:
+            close(dxinfox[ channum ].msg_fd);
+            get_digs(channum, &dxinfox[ channum ].digbuf, 10, 50, 0x120F);
+            return 0;
+
+        case ST_TC24MENU2:
+            close(dxinfox[ channum ].msg_fd);
+            dx_clrdigbuf(dxinfox[channum].chdev);
+            dxinfox[ channum ].state = ST_TC24MENU;
+            dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+            if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                file_error( channum, "sounds/tc24/greeting.pcm" );
+                return -1;
+            }
+            return 0;
+
+        case ST_TC24MENU1E:
+            if (errcnt[channum] > 2) {
+                dxinfox[ channum ].state = ST_ONHOOK;
+                set_hkstate(channum, DX_ONHOOK);
+                return 0;
+            }
+            else {
+                dxinfox[ channum ].state = ST_TC24MENU1;
+                dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_howtomenu.pcm", O_RDONLY);
+                if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                    file_error( channum, "sounds/tc24/tc_howtomenu.pcm" );
+                    return -1;
+                }
+                return 0;
+            }
+
+        case ST_TC24MENUE:
+            if (errcnt[channum] > 2) {
+                dxinfox[ channum ].state = ST_ONHOOK;
+                set_hkstate(channum, DX_ONHOOK);
+                return 0;
+            }
+            else {
+                dxinfox[ channum ].state = ST_TC24MENU;
+                dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                    file_error( channum, "sounds/tc24/greeting.pcm" );
+                    return -1;
+                }
+                return 0;
+            }
+
+        case ST_TC24MENU:
+            close(dxinfox[ channum ].msg_fd);
+            // Digis 1-8 should be considered terminating, but we should collect a maximum of two digits so ** can work.
+            get_digs(channum, &dxinfox[ channum ].digbuf, 2, 0x1FE, 0x2200);
+            return 0;
+
         case ST_ACTIVATIONOP:
             close(dxinfox[ channum ].msg_fd);
             connchan[ channum ] = idle_trunkhunt( channum, 1, maxchans, false );
@@ -6392,6 +6628,9 @@ int play_hdlr() {
             set_hkstate(channum, DX_ONHOOK);
             return 0;
 
+        case ST_TC24BBSREC:
+        case ST_TC24BBS:
+        case ST_TC24MENU1:
         case ST_ADMINADD2:
             close(dxinfox[ channum ].msg_fd);
             get_digs(channum, &dxinfox[ channum ].digbuf, 1, 50, 0x200);
@@ -7209,14 +7448,14 @@ int play_hdlr() {
             anncnum[channum] = 0;
             ownies[ channum ] = 110;
 
-            strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/vmb_youhave.pcm");
-            multiplay[channum][0] = open(dxinfox[ channum ].msg_name, O_RDONLY);
+            //strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/vmb_youhave.pcm");
+            multiplay[channum][0] = open("sounds/vmail/vmb_youhave.pcm", O_RDONLY);
             sprintf(dxinfox[ channum ].msg_name, "sounds/msgcount/%d.pcm", newmsg[channum]);
             multiplay[channum][1] = open(dxinfox[ channum ].msg_name, O_RDONLY);
-            strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/newmsg.pcm");
-            multiplay[channum][2] = open(dxinfox[ channum ].msg_name, O_RDONLY);
-            strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/and.pcm");
-            multiplay[channum][3] = open(dxinfox[ channum ].msg_name, O_RDONLY);
+            //strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/newmsg.pcm");
+            multiplay[channum][2] = open("sounds/vmail/newmsg.pcm", O_RDONLY);
+            //strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/and.pcm");
+            multiplay[channum][3] = open("sounds/vmail/and.pcm", O_RDONLY);
 
             sprintf(filetmp2[channum], "%s/old", filetmp[channum]);
             errcnt[ channum ] = 1;
@@ -7237,8 +7476,8 @@ int play_hdlr() {
             sprintf(dxinfox[ channum ].msg_name, "sounds/msgcount/%d.pcm", oldmsg[channum]);
 
             multiplay[channum][4] = open(dxinfox[ channum ].msg_name, O_RDONLY);
-            strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/savedmsg.pcm");
-            multiplay[channum][5] = open(dxinfox[ channum ].msg_name, O_RDONLY);
+            //strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/savedmsg.pcm");
+            multiplay[channum][5] = open("sounds/vmail/savedmsg.pcm", O_RDONLY);
 
             dxinfox[channum].state = ST_VMAILMENU;
 
@@ -7894,6 +8133,8 @@ int play_hdlr() {
             ownies[channum] = 6;
 
             if (msgnum[channum] == 255) {
+                dxinfox[ channum ].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 0);
                 return -1;    // Temporary file queue is full. Something isn't working right. Let's stop.
             }
 
@@ -7907,6 +8148,11 @@ int play_hdlr() {
 
         case ST_VMAIL5:
         case ST_EMREC3:
+        case ST_DCBBSREC3:
+        case ST_TC24BBSREC4:
+            // This is to stop this naughty code from leaking file descriptors.
+            if (fcntl(dxinfox[channum].msg_fd, F_GETFD) != -1) close(dxinfox[ channum ].msg_fd);
+
             if (errcnt[ channum ] >= 3) {
                 errcnt[ channum ] = 0;
 
@@ -7914,6 +8160,16 @@ int play_hdlr() {
 
                     if (dxinfox[ channum ].state == ST_EMREC3) {
                         sprintf(filetmp[channum], "sounds/emtanon/temp/%d.pcm", msgnum[channum]);   // Delete user's recording; they hung up or something.
+                        remove(filetmp[ channum ]);
+                    }
+
+                    else if (dxinfox[ channum ].state == ST_DCBBSREC3) {
+                        sprintf(filetmp[channum], "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);   // Delete user's recording; they hung up or something.
+                        remove(filetmp[ channum ]);
+                    }
+
+                    else if (dxinfox[ channum ].state == ST_TC24BBSREC4) {
+                        sprintf(filetmp[channum], "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);   // Delete user's recording; they hung up or something.
                         remove(filetmp[ channum ]);
                     }
 
@@ -7971,6 +8227,24 @@ int play_hdlr() {
                     if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
                         disp_msg("...shit, the BBS begin message recording recording isn't working");
                     }
+                }
+                else if (dxinfox[ channum ].state == ST_DCBBSREC3) {
+                    dxinfox[ channum ].state = ST_DCBBSREC2;
+                    strcpy(dxinfox[ channum ].msg_name, "sounds/emtanon/message_options.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording isn't working");
+                    }
+                }
+                else if (dxinfox[ channum ].state == ST_TC24BBSREC4) {
+                    dxinfox[ channum ].state = ST_TC24BBSREC3;
+                    strcpy(dxinfox[ channum ].msg_name, "sounds/emtanon/message_options.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording isn't working");
+                    }
                 } else {
                     dxinfox[ channum ].state = ST_VMAIL3;
                     strcpy(dxinfox[ channum ].msg_name, "sounds/vmail/recmenu.pcm");
@@ -7987,25 +8261,40 @@ int play_hdlr() {
 
         case ST_VMAIL3:
         case ST_EMREC2:
+        case ST_DCBBSREC2:
+        case ST_TC24BBSREC3:
             close(dxinfox[ channum ].msg_fd);
 
             if (get_digits(channum, &(dxinfox[ channum ].digbuf), 1) == -1) {
                 disp_msgf("Cannot get digits in Emtanon BBS recorder, channel %s", ATDV_NAMEP(chdev));
                 dxinfox[ channum ].state = ST_GOODBYE;
                 play(channum, errorfd, 0, 0, 1);
-                return (-1);
+                return -1;
             }
 
             return (0);
 
+        case ST_DCBBSREC:
+        case ST_TC24BBSREC2:
         case ST_EMREC1:
             close(dxinfox[ channum ].msg_fd);
-            sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/temp/%d.pcm", msgnum[channum]);
+            switch(dxinfox[ channum ].state) {
+                case ST_TC24BBSREC2:
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);
+                    break;
+                case ST_DCBBSREC:
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);
+                    break;
+                default:
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/temp/%d.pcm", msgnum[channum]);
+            }
             dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDWR | O_TRUNC | O_CREAT, 0666);
 
             if (dxinfox[ channum ].msg_fd == -1) {
                 disp_msgf("Cannot create %s for recording", dxinfox[ channum ].msg_name);
-                errcode[channum] = -1;
+                dxinfox[ channum ].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 1);
+                return -1;
             }
 
             if (errcode[channum] == 0) {
@@ -8654,6 +8943,9 @@ int play_hdlr() {
                 break;
             }
 
+        case ST_TC24BBS2:
+        case ST_DCBBS:
+        case ST_TCTUTORIAL:
         case ST_EMPLAY2:
         case ST_DYNPLAY:
 
@@ -8894,6 +9186,46 @@ int record_hdlr() {
 
             return (0);
 
+        case ST_TC24BBSREC2:
+
+            dxinfox[ channum ].state = ST_TC24BBSREC3;
+            close(dxinfox[ channum ].msg_fd);
+            // sprintf( dxinfox[ channum ].msg_name, "sounds/emtanon/message_options.vox");
+            dxinfox[ channum ].msg_fd = open("sounds/emtanon/message_options.vox", O_RDONLY);
+
+            if (dx_clrdigbuf(chdev) == -1) {
+                disp_msgf("Cannot clear DTMF Buffer for %s", ATDV_NAMEP(chdev));
+            }
+
+            if (play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0) == -1) {
+                disp_msg("Couldn't play the message recorder menu. Whoops...");
+                dxinfox[channum].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 0);
+                return -1;
+            }
+
+            return 0;
+
+        case ST_DCBBSREC:
+
+            dxinfox[ channum ].state = ST_DCBBSREC2;
+            close(dxinfox[ channum ].msg_fd);
+            // sprintf( dxinfox[ channum ].msg_name, "sounds/emtanon/message_options.vox");
+            dxinfox[ channum ].msg_fd = open("sounds/emtanon/message_options.vox", O_RDONLY);
+
+            if (dx_clrdigbuf(chdev) == -1) {
+                disp_msgf("Cannot clear DTMF Buffer for %s", ATDV_NAMEP(chdev));
+            }
+
+            if (play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0) == -1) {
+                disp_msg("Couldn't play the message recorder menu. Whoops...");
+                dxinfox[channum].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 0);
+                return -1;
+            }
+
+            return 0;
+
         case ST_EMREC1:
 
             dxinfox[ channum ].state = ST_EMREC2;
@@ -8903,15 +9235,16 @@ int record_hdlr() {
 
             if (dx_clrdigbuf(chdev) == -1) {
                 disp_msgf("Cannot clear DTMF Buffer for %s", ATDV_NAMEP(chdev));
-                return (-1);
             }
 
             if (play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0) == -1) {
                 disp_msg("Couldn't play the message recorder menu. Whoops...");
-                return (-1);
+                dxinfox[channum].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 0);
+                return -1;
             }
 
-            return (0);
+            return 0;
 
         case ST_VMAILSETGREC:
         case ST_VMAILSETGREC2:
@@ -8932,6 +9265,8 @@ int record_hdlr() {
 
             if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
                 disp_msg("Couldn't play the message recorder menu. Whoops...");
+                dxinfox[channum].state = ST_GOODBYE;
+                play(channum, errorfd, 0, 0, 0);
                 return (-1);
             }
 
@@ -9304,6 +9639,579 @@ int getdig_hdlr() {
             break;
     }
     switch (dxinfox[ channum ].state) {
+
+        case ST_TC24CALL2:
+            switch(dxinfox[ channum ].digbuf.dg_value[0]) {
+                case 0x31:
+                    dxinfox[ channum ].state = ST_TC24MENU2;
+                    // SQL queries go here.
+                    char * err_msg;
+                    char query[59];
+                    char npa[4];
+                    snprintf(npa, 4, "%s", filetmp[channum]);
+                    npa[3] = 0x00; // Insert null terminator
+                    if (altsig & 4) {
+                        if (!fprintf(calllog, "%s;Telechallenge Outdial Attempt;CPN %s;Dest %s\n", timeoutput(channum), isdninfo[channum].cpn, filetmp[channum])) {
+                            disp_msg("Failed to log");
+                        }
+                        fflush(calllog);
+                    }
+                    snprintf(query, 58, "SELECT COUNT(*) FROM area_codes WHERE area_code = '%s';", npa);
+                    if (sqlite3_exec( tc_blacklist, query, npa_cb, (void*) &channum, &err_msg) != SQLITE_OK) {
+                        disp_msgf("SQL SELECT ERROR: %s", err_msg);
+                        dxinfox[channum].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 1);
+                        return -1;
+                    }
+                    return 0;
+                case 0x32:
+                    errcnt[channum] = 0;
+                    memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                    dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_enternum.pcm", O_RDONLY);
+                    dxinfox[ channum ].state = ST_TC24CALL;
+                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                        file_error(channum, "sounds/tc24/tc_enternum.pcm");
+                        return -1;
+                    }
+                    return 0;
+
+                default:
+                    dxinfox[ channum ].state = ST_TC24CALL2E;
+                    errcnt[channum]++;
+                    play(channum, invalidfd, 0, 0, 0);
+                    return 0;
+            }
+
+        case ST_TC24CALL:
+            if (ATDX_TERMMSK(chdev) & TM_MAXDTMF) {
+                // Read back for confirmation
+                unsigned char length = strlen(dxinfox[channum].digbuf.dg_value);
+                unsigned char counter;
+                for (counter = 0; counter < length; counter++) {
+                    // Is this a digit, or did some wiseass press * or something?
+                    if ((dxinfox[channum].digbuf.dg_value[counter] < 0x30) ||
+                        (dxinfox[channum].digbuf.dg_value[counter] > 0x40)) {
+                        dxinfox[ channum ].state = ST_TC24CALLE;
+                        errcnt[channum]++;
+                        play(channum, invalidfd, 0, 0, 0);
+                        return 0;
+                    }
+                }
+                multiplay[channum][0] = open("sounds/tc24/challenging.pcm", O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[0]);
+                multiplay[channum][1] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[1]);
+                multiplay[channum][2] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[2]);
+                multiplay[channum][3] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[3]);
+                multiplay[channum][4] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[4]);
+                multiplay[channum][5] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[5]);
+                multiplay[channum][6] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[6]);
+                multiplay[channum][7] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[7]);
+                multiplay[channum][8] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[8]);
+                multiplay[channum][9] = open(dxinfox[channum].msg_name, O_RDONLY);
+                sprintf(dxinfox[channum].msg_name, "sounds/digits1/%c.pcm", dxinfox[channum].digbuf.dg_value[9]);
+                multiplay[channum][10] = open(dxinfox[channum].msg_name, O_RDONLY);
+                multiplay[channum][11] = open("sounds/tc24/right.pcm", O_RDONLY);
+                dxinfox[ channum ].state = ST_TC24CALL2;
+                if (playmulti( channum, 12, 0x80, multiplay[channum]) == -1) {
+                    unsigned char counter;
+                    for (counter = 0; counter < 12; counter++) {
+                        close(multiplay[channum][counter]);
+                    }
+                    dxinfox[ channum ].state = ST_GOODBYE;
+                    disp_msg("Couldn't play confirmation message!");
+                    play(channum, errorfd, 0, 0, 0);
+                    return -1;
+                }
+                strncpy(filetmp[channum], dxinfox[ channum ].digbuf.dg_value, MAXMSG);
+                //snprintf(filetmp[channum], MAXMSG, "%s1%s", config.dialout_prefix, dxinfox[channum].digbuf.dg_value);
+                return 0;
+
+            }
+            else {
+                // Invalid
+                dxinfox[ channum ].state = ST_TC24CALLE;
+                errcnt[channum]++;
+                play(channum, invalidfd, 0, 0, 0);
+                return 0;
+            }
+
+        case ST_TC24BBSREC:
+            // Record
+            switch(dxinfox[channum].digbuf.dg_value[0]) {
+
+                case 0x31:
+                    // Ice Bucket Recordings
+                    msgnum[channum] = 0;
+                    errcnt[channum] = 0; // Let's borrow the error counter for this. It needs to be reset anyway.
+
+                    while ((errcnt[channum] == 0) && (msgnum[channum] != 255)) {
+                        msgnum[channum]++;
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);
+                        errcnt[channum] = stat(dxinfox[ channum ].msg_name, &sts);
+                    }
+                    errcnt[channum] = 0;
+
+                    if (msgnum[channum] == 255) {
+                        dxinfox[ channum ].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 0);
+                        return -1;    // Temporary file queue is full. Something isn't working right. Let's stop.
+                    }
+                    dxinfox[ channum ].state = ST_TC24BBSREC2;
+                    dxinfox[ channum ].msg_fd = open("sounds/emtanon/beginmsg.vox", O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording isn't working");
+                        file_error( channum, "sounds/emtanon/beginmsg.vox");
+                    }
+
+                    return (errcode[channum]);
+
+                case 0x32:
+                    // Defcon Voice BBS
+                    msgnum[channum] = 0;
+                    errcnt[channum] = 0; // Let's borrow the error counter for this. It needs to be reset anyway.
+
+                    while ((errcnt[channum] == 0) && (msgnum[channum] != 255)) {
+                        msgnum[channum]++;
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);
+                        errcnt[channum] = stat(dxinfox[ channum ].msg_name, &sts);
+                    }
+                    errcnt[channum] = 0;
+
+                    if (msgnum[channum] == 255) {
+                        dxinfox[ channum ].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 0);
+                        return -1;    // Temporary file queue is full. Something isn't working right. Let's stop.
+                    }
+                    dxinfox[ channum ].state = ST_DCBBSREC;
+                    dxinfox[ channum ].msg_fd = open("sounds/emtanon/beginmsg.vox", O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording isn't working");
+                        file_error( channum, "sounds/emtanon/beginmsg.vox");
+                    }
+
+                    return (errcode[channum]);
+
+                case '*':
+                    // Go back to the main menu
+                    errcnt[channum] = 0;
+                    dxinfox[ channum ].state = ST_TC24MENU;
+                    dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                        file_error( channum, "sounds/tc24/greeting.pcm" );
+                        return -1;
+                    }
+                    return 0;
+
+                default:
+                    // Invalid
+                    errcnt[channum]++;
+                    dxinfox[ channum ].state = ST_TC24BBSRECE;
+                    play(channum, invalidfd, 0, 0, 0);
+                    return 0;
+            }
+
+        case ST_TC24BBS:
+            // Playback
+            switch(dxinfox[channum].digbuf.dg_value[0]) {
+
+                case 0x31:
+                    // Ice Bucket Recordings
+                    dxinfox[ channum ].state = ST_TC24BBS2;
+                    ownies[ channum ] = 0; // Initialize variables
+                    anncnum[ channum ] = 0;
+                    errcnt[ channum ] = 1;
+
+                    while (errcnt[ channum ] == 1) {
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[ channum ]);
+
+                        if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                            errcnt[ channum ] = 0;
+                        } else {
+                            anncnum[ channum ]++;
+                        }
+                    }
+
+                    maxannc[ channum ] = (anncnum[ channum ]);
+                    anncnum[ channum ] = 0;
+                    minannc[ channum ] = -1;
+
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[ channum ]);
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if (dxinfox[ channum ].msg_fd == -1) {
+                        disp_msgf("Cannot open %s for play-back. Recovering...", dxinfox[ channum ].msg_name);
+                        dxinfox[ channum ].msg_fd = open("sounds/emtanon/nomessages.vox", O_RDONLY);
+                        if (dxinfox[ channum ].msg_fd == -1) {
+                            file_error(channum, "sounds/emtanon/nomessages.vox");
+                            return -1;
+                        }
+                        dxinfox[ channum ].state = ST_TC24MENU2;
+                        errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0);
+                        return (errcode[channum]);
+                    }
+
+                    if (errcode[channum] == 0) {
+                        errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
+                    }
+
+                    return (errcode[channum]);
+
+                case 0x32:
+                    // Defcon Voice BBS
+                    dxinfox[ channum ].state = ST_DCBBS;
+                    ownies[ channum ] = 0; // Initialize variables
+                    anncnum[ channum ] = 0;
+                    errcnt[ channum ] = 1;
+
+                    while (errcnt[ channum ] == 1) {
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[ channum ]);
+
+                        if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                            errcnt[ channum ] = 0;
+                        } else {
+                            anncnum[ channum ]++;
+                        }
+                    }
+
+                    maxannc[ channum ] = (anncnum[ channum ]);
+                    anncnum[ channum ] = 0;
+                    minannc[ channum ] = -1;
+
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[ channum ]);
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if (dxinfox[ channum ].msg_fd == -1) {
+                        disp_msgf("Cannot open %s for play-back. Recovering...", dxinfox[ channum ].msg_name);
+                        dxinfox[ channum ].msg_fd = open("sounds/emtanon/nomessages.vox", O_RDONLY);
+                        if (dxinfox[ channum ].msg_fd == -1) {
+                            file_error(channum, "sounds/emtanon/nomessages.vox");
+                            return -1;
+                        }
+                        dxinfox[ channum ].state = ST_TC24MENU2;
+                        errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0);
+                        return (errcode[channum]);
+                    }
+
+                    if (errcode[channum] == 0) {
+                        errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
+                    }
+
+                    return (errcode[channum]);
+
+                case '*':
+                    // Go back to the main menu
+                    errcnt[channum] = 0;
+                    dxinfox[ channum ].state = ST_TC24MENU;
+                    dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                        file_error( channum, "sounds/tc24/greeting.pcm" );
+                        return -1;
+                    }
+                    return 0;
+                default:
+                    // Invalid
+                    errcnt[channum]++;
+                    dxinfox[ channum ].state = ST_TC24BBSE;
+                    play(channum, invalidfd, 0, 0, 0);
+                    return 0;
+            }
+
+        case ST_TC24MENU1:
+            if (ATDX_TERMMSK(chdev) & TM_MAXDTMF) {
+                switch(dxinfox[channum].digbuf.dg_value[0]) {
+                    case 0x32:
+                        // Go to Lion tutorial
+                        dxinfox[ channum ].state = ST_TCTUTORIAL;
+                        ownies[ channum ] = 0; // Initialize variables
+                        anncnum[ channum ] = 0;
+                        errcnt[ channum ] = 1;
+
+                        while (errcnt[ channum ] == 1) {
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[ channum ]);
+
+                        if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                            errcnt[ channum ] = 0;
+                        } else {
+                            anncnum[ channum ]++;
+                            }
+                        }
+
+                        maxannc[ channum ] = (anncnum[ channum ]);
+                        anncnum[ channum ] = 0;
+                        minannc[ channum ] = -1;
+
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[ channum ]);
+                        dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                        if (dxinfox[ channum ].msg_fd == -1) {
+                            disp_msgf("Cannot open %s for play-back", dxinfox[ channum ].msg_name);
+                            file_error(channum, dxinfox[ channum ].msg_name);
+                            return -1;
+                        }
+                        play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
+                        return 0;
+
+                    case 0x31:
+                        // Repeat recording
+                        errcnt[ channum ] = 0;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_howtomenu.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/tc_howtomenu.pcm");
+                            return -1;
+                        }
+
+                        return 0;
+
+                    case '*':
+                        // Return to main menu
+                        errcnt[ channum ] = 0;
+                        dxinfox[ channum ].state = ST_TC24MENU;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                            file_error( channum, "sounds/tc24/greeting.pcm" );
+                            return -1;
+                        }
+                        return 0;
+                    default:
+                        errcnt[channum]++;
+                        dxinfox[channum].state = ST_TC24MENU1E;
+                        // The invalid recording shouldn't be pre-emptable with DTMF. The reason being if there's a big spill of invalid digits, it's more
+                        // likely to be absorbed.
+                        play(channum, invalidfd, 0, 0, 0);
+                        return 0;
+                }
+            }
+            else {
+                errcnt[channum]++;
+                dxinfox[channum].state = ST_TC24MENU1E;
+                // The invalid recording shouldn't be pre-emptable with DTMF. The reason being if there's a big spill of invalid digits, it's more
+                // likely to be absorbed.
+                play(channum, invalidfd, 0, 0, 0);
+                return 0;
+            }
+            return 0;
+
+
+        case ST_TC24MENU:
+            // JCT boards return TM_MAXDTMF and TM_DIGIT when both conditions are satisfied. DM3s only return the latter.
+            // Thankfully since we're collecting two digits, this won't matter and we can treat both boards the same.
+
+            if (ATDX_TERMMSK(chdev) & TM_MAXDTMF) {
+                // Check for ** - for the fake admin panel that reads off a bunch of useless shit.
+                if (strcmp("**", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                    // Admin status panel thing's here.
+                    dxinfox[ channum ].state = ST_TC24MENU2; // For the placeholder recording
+                    dxinfox[ channum ].msg_fd = open("sounds/tc24/placeholder.pcm", O_RDONLY);
+                    // This should go to a placeholder recording for the moment; this routine's been relegated to a second-tier status.
+                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                        file_error(channum, "sounds/tc24/placeholder.pcm");
+                        return -1;
+                    }
+                    return 0;
+                }
+
+                // Not **? Fuck all that, man.
+                errcnt[channum]++;
+                dxinfox[channum].state = ST_TC24MENUE;
+                // The invalid recording shouldn't be pre-emptable with DTMF. The reason being if there's a big spill of invalid digits, it's more
+                // likely to be absorbed.
+                play(channum, invalidfd, 0, 0, 0);
+                return 0;
+            }
+            else if (ATDX_TERMMSK(chdev) & TM_DIGIT) {
+                switch(dxinfox[channum].digbuf.dg_value[0]) {
+                    case 0x33:
+                        // Learn about/how to play the Telechallenge
+                        // This should go to another menu with a few options - one to access the tutorial.
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_TC24MENU1;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_howtomenu.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/tc_howtomenu.pcm");
+                            return -1;
+                        }
+
+                        return 0;
+
+                    case 0x31:
+                        // How to play the hacker cooling contraption challenge
+                        // This goes to a quick explanation and back to the main menu.
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_howtohccc.pcm", O_RDONLY);
+                        dxinfox[ channum ].state = ST_TC24MENU2;
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/tc_howtohccc.pcm");
+                            return -1;
+                        }
+
+                        return 0;
+
+                    case 0x32:
+                        // Nominate a hacker you want to be chilled
+                        // This goes to a callout menu
+                        errcnt[channum] = 0;
+                        time_t rawtime;
+                        struct tm *info;
+                        time(&rawtime);
+                        info = localtime(&rawtime);
+                        strftime(filetmp3[channum], 3, "%H", info);
+                        unsigned char timeout = atoi(filetmp3[channum]);
+                        disp_msgf("DEBUG: Hour returned was %d", timeout);
+                        #ifdef EASTERN
+                            if ((timeout > 20) || (timeout < 13)) {
+                        #else
+                            if ((timeout > 17) || (timeout < 10)) {
+                        #endif
+                            dxinfox[ channum ].state = ST_TC24MENU2;
+                            dxinfox[ channum ].msg_fd = open("sounds/tc24/outside_hours.pcm", O_RDONLY);
+                            if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                                file_error(channum, "sounds/tc24/outside_hours.pcm");
+                                return -1;
+                            }
+                            time1[channum] = 0;
+                            return 0;
+                        }
+                        time1[channum] = 0;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/tc_enternum.pcm", O_RDONLY);
+                        dxinfox[ channum ].state = ST_TC24CALL;
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/tc_enternum.pcm");
+                            return -1;
+                        }
+                        return 0;
+
+                    case 0x34:
+                        // Voice BBS Playback
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_TC24BBS;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/bbs_select.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/bbs_select.pcm");
+                            return -1;
+                        }
+
+                        return 0;
+
+                    case 0x35:
+                        // Voice BBS Record
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_TC24BBSREC;
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/bbs_select.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/bbs_select.pcm");
+                            return -1;
+                        }
+
+                        return 0;
+
+
+                    case 0x36:
+                        // I FUCKING HATE VEGAS
+                        // Single recording, return to main menu
+                        errcnt[channum] = 0;
+                        voicemail_xfer(channum, "1001");
+                        /*
+                        dxinfox[ channum ].msg_fd = open("sounds/tc24/fuckvegas.pcm", O_RDONLY);
+                        dxinfox[ channum ].state = ST_TC24MENU2;
+                        // We can combine the state with menu option 2's, since it's doing the same thing.
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/tc24/fuckvegas.pcm");
+                            return -1;
+                        }
+                        */
+                        return 0;
+
+                    case 0x37:
+                        // Argentine Lottery
+                        // Loop piecing together Argentine lottery stuff
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_TC24ARG;
+                        srandom(time(NULL));
+                        disp_status(channum, "Playing Riverito");
+                        anncnum[ channum ] = 0;
+                        errcnt[ channum ] = 1;
+                        while (errcnt[ channum ] == 1) {
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", anncnum[ channum ]);
+            
+                            if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                                errcnt[ channum ] = 0;
+                            } else {
+                                anncnum[ channum ]++;
+                            }
+                        }
+                        maxannc[ channum ] = anncnum[ channum ];
+                        anncnum[channum] = 0;
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][0] = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][1] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][2] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][3] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][4] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][5] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][6] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][7] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][8] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/riverito/%d.pcm", random_at_most(maxannc[channum]));
+                        multiplay[channum][9] = open(dxinfox[channum].msg_name, O_RDONLY);
+                        if (playmulti( channum, 10, 0x00, multiplay[channum]) == -1) {
+                            unsigned char counter;
+                            for (counter = 0; counter < 10; counter++) {
+                                close(multiplay[channum][counter]);
+                            }
+                            dxinfox[ channum ].state = ST_GOODBYE;
+                            disp_msg("Couldn't play confirmation message!");
+                            play(channum, errorfd, 0, 0, 0);
+                            return -1;
+                        }
+                        return 0;
+
+                    case 0x38:
+                        errcnt[channum] = 0;
+                        voicemail_xfer(channum, "1000");
+                        return 0;
+
+
+                    default:
+                        // There should really be a function for handling invalid digits. We do this so, *so* often...
+
+                        // Invalid selection. Since the termination mask is present, we should never actually get to this, but let's handle the error anyway.
+                        errcnt[channum]++;
+                        dxinfox[channum].state = ST_TC24MENUE;
+                        // The invalid recording shouldn't be pre-emptable with DTMF. The reason being if there's a big spill of invalid digits, it's more
+                        // likely to be absorbed.
+                        play(channum, invalidfd, 0, 0, 0);
+                        return 0;
+                }
+            }
+
+
+            else {
+                // Whatever you pressed, it's wrong.
+                errcnt[channum]++;
+                dxinfox[channum].state = ST_TC24MENUE;
+                // The invalid recording shouldn't be pre-emptable with DTMF. The reason being if there's a big spill of invalid digits, it's more
+                // likely to be absorbed.
+                play(channum, invalidfd, 0, 0, 0);
+                return 0;
+            }
 
         case ST_ADMINADD3:
             if (ATDX_TERMMSK(chdev) & TM_MAXDTMF) {
@@ -11807,13 +12715,6 @@ int getdig_hdlr() {
 
         case ST_VMAILMENU2:
 
-            // This is placeholder code. Replace it when we're done with the voicemail menu.
-            // dxinfox[ channum ].state = ST_GOODBYE;
-            // play( channum, goodbyefd, 0, 0);
-            // return(0);
-
-            // This is where the actual code is. Get rid of that crap above when we're done.
-
             if (strcmp("1", dxinfox[ channum ].digbuf.dg_value) == 0) {
                 errcnt[ channum ] = 0;
                 anncnum[ channum ] = 0;
@@ -11837,10 +12738,13 @@ int getdig_hdlr() {
                 sprintf(dxinfox[ channum ].msg_name, "%s/0.pcm", filetmp2[ channum ]);
 
                 if ((dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY)) == -1) {
-                    disp_msgf("Failure playing %s", dxinfox[ channum ].msg_name);
-                    dxinfox[channum].state = ST_GOODBYE;
-                    play(channum, errorfd, 0, 0, 1);
-                    return (-1);
+                    dxinfox[channum].state = ST_VMAILCHECK1;
+                    dxinfox[channum].msg_fd = open("sounds/vmail/endofmsg.pcm", O_RDONLY);
+                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 1) == -1) {
+                        disp_msg("Couldn't find the end of MSG!");
+                        file_error(channum, "sounds/vmail/endofmsg.pcm");
+                    }
+                    return -1;
                 }
 
                 play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
@@ -11869,10 +12773,13 @@ int getdig_hdlr() {
                 sprintf(dxinfox[ channum ].msg_name, "%s/0.pcm", filetmp2[ channum ]);
 
                 if ((dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY)) == -1) {
-                    disp_msgf("Failure playing %s", dxinfox[ channum ].msg_name);
-                    dxinfox[channum].state = ST_GOODBYE;
-                    play(channum, errorfd, 0, 0, 1);
-                    return (-1);
+                    dxinfox[channum].state = ST_VMAILCHECK1;
+                    dxinfox[channum].msg_fd = open("sounds/vmail/endofmsg.pcm", O_RDONLY);
+                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 1) == -1) {
+                        disp_msg("Couldn't find the end of MSG!");
+                        file_error(channum, "sounds/vmail/endofmsg.pcm");
+                    }
+                    return -1;
                 }
 
                 play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
@@ -12943,16 +13850,33 @@ int getdig_hdlr() {
 
         case ST_VMAIL3:
         case ST_EMREC2:
+        case ST_DCBBSREC2:
+        case ST_TC24BBSREC3:
+            // TO DO: The recording code really should be overhauled >.<
             if (strcmp("1", dxinfox[ channum ].digbuf.dg_value) == 0) {
                 errcnt[channum] = 0;
 
-                if (dxinfox[ channum ].state == ST_VMAIL3) {
-                    dxinfox[ channum ].msg_fd = open(filetmp2[channum], O_RDONLY);
-                    dxinfox[ channum ].state = ST_VMAIL4;
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/temp/%d.pcm", msgnum[channum]);
-                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
-                    dxinfox[ channum ].state = ST_EMREC3;
+                // At the very least, this was added to keep a chain of if/else statements
+                // from being executed until more serious work can be done.
+                switch(dxinfox[channum].state) {
+                    case ST_VMAIL3:
+                        dxinfox[ channum ].msg_fd = open(filetmp2[channum], O_RDONLY);
+                        dxinfox[ channum ].state = ST_VMAIL4;
+                        break;
+                    case ST_EMREC2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/temp/%d.pcm", msgnum[channum]);
+                        dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                        dxinfox[ channum ].state = ST_EMREC3;
+                        break;
+                    case ST_DCBBSREC2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);
+                        dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                        dxinfox[ channum ].state = ST_DCBBSREC3;
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);
+                        dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                        dxinfox[ channum ].state = ST_TC24BBSREC4;
                 }
 
                 if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)) == -1) {
@@ -12973,12 +13897,28 @@ int getdig_hdlr() {
                     if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
                         disp_msg("...shit, the BBS begin message recording recording is broke");
                     }
-                } else {
+                } else if (dxinfox[ channum ].state == ST_VMAIL3) {
                     dxinfox[ channum ].state = ST_VMAIL2;
                     dxinfox[ channum ].msg_fd = open("sounds/vmail/beginmsg.pcm", O_RDONLY);
 
                     if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)) == -1) {
                         file_error(channum, "sounds/vmail/beginmsg.pcm");
+                    }
+                } else if (dxinfox[ channum ].state == ST_DCBBSREC2) {
+                    dxinfox[ channum ].state = ST_DCBBSREC;
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/beginmsg.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording is broke");
+                    }
+                } else {
+                    dxinfox[ channum ].state = ST_TC24BBSREC2;
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/beginmsg.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS begin message recording recording is broke");
                     }
                 }
 
@@ -13002,13 +13942,55 @@ int getdig_hdlr() {
 
                     if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
                         disp_msg("...shit, the BBS deleted recording is broke");
+                        file_error(channum, "sounds/emtanon/deleted.vox");
+                        return -1;
+                    }
+                } else if (dxinfox[ channum ].state == ST_DCBBSREC2) {
+                    sprintf(filetmp[channum], "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);
+
+                    if (remove(filetmp[ channum ]) == -1) {
+                        dxinfox[ channum ].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 0);
+                        disp_msgf("Uhh, something's wrong. DC BBS deletion failed.");
+                        return (-1);
+                    }
+
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/deleted.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                    dxinfox[ channum ].state = ST_TC24MENU2; // This *should* take us back to the main menu. If it doesn't, well, fix it or something.
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS deleted recording is broke");
+                        file_error(channum, "sounds/emtanon/deleted.vox");
+                        return -1;
+                    }
+                } else if (dxinfox[ channum ].state == ST_TC24BBSREC3) {
+                    sprintf(filetmp[channum], "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);
+
+                    if (remove(filetmp[ channum ]) == -1) {
+                        disp_msgf("Uhh, something's wrong. TC24 BBS deletion failed.");
+                        dxinfox[ channum ].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 0);
+                        return (-1);
+                    }
+
+                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/deleted.vox");
+                    dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                    dxinfox[ channum ].state = ST_TC24MENU2; // This *should* take us back to the main menu. If it doesn't, well, fix it or something.
+
+                    if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                        disp_msg("...shit, the BBS deleted recording is broke");
+                        file_error(channum, "sounds/emtanon/deleted.vox");
+                        return -1;
                     }
                 }
 
 
                 else {
                     if (remove(filetmp2[ channum ]) == -1) {
-                        disp_msgf("Uhh, something's wrong. Emtanon deletion failed.");
+                        disp_msgf("Uhh, something's wrong. Voicemail deletion failed.");
+                        dxinfox[ channum ].state = ST_GOODBYE;
+                        play( channum, errorfd, 0, 0, 0);
                         return (-1);
                     }
 
@@ -13016,6 +13998,8 @@ int getdig_hdlr() {
 
                     if (play(channum, goodbyefd, 0, 0, 0) == -1) {
                         disp_msgf("Cannot Play Goodbye Message on channel %s", ATDV_NAMEP(chdev));
+                        dxinfox[channum].state = ST_GOODBYE;
+                        play(channum, errorfd, 0, 0, 0);
                     }
                 }
 
@@ -13025,6 +14009,10 @@ int getdig_hdlr() {
             if (strcmp("4", dxinfox[ channum ].digbuf.dg_value) == 0) {
                 if (dxinfox[ channum ].state == ST_EMREC2) {
                     sprintf(filetmp[channum], "sounds/emtanon/temp/%d.pcm", msgnum[channum]);
+                } else if (dxinfox[ channum ].state == ST_DCBBSREC2) {
+                    sprintf(filetmp[channum], "sounds/tc24/dcbbs/temp/%d.pcm", msgnum[channum]);
+                } else if (dxinfox[ channum ].state == ST_TC24BBSREC3) {
+                    sprintf(filetmp[channum], "sounds/tc24/bbs/temp/%d.pcm", msgnum[channum]);
                 }
 
                 anncnum[ channum ] = 0;
@@ -13033,37 +14021,65 @@ int getdig_hdlr() {
 
                 if (dxinfox[ channum ].state == ST_EMREC2)
                     while (errcnt[ channum ] == 1) {
-                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[ channum ]);
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[ channum ]);
 
-                        if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
-                            errcnt[ channum ] = 0;
-                        } else {
-                            anncnum[ channum ]++;
+                            if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                                errcnt[ channum ] = 0;
+                            } else {
+                                anncnum[ channum ]++;
+                        }
+                    } else if (dxinfox[ channum ].state == ST_DCBBSREC2)
+                        while (errcnt[ channum ] == 1) {
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[ channum ]);
+
+                            if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                                errcnt[ channum ] = 0;
+                            } else {
+                                anncnum[ channum ]++;
+                        }
+                    } else if (dxinfox[ channum ].state == ST_TC24BBSREC3)
+                        while (errcnt[ channum ] == 1) {
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[ channum ]);
+
+                            if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                                errcnt[ channum ] = 0;
+                            } else {
+                                anncnum[ channum ]++;
                         }
                     } else {
-                    while (errcnt[ channum ] == 1) {
-                        sprintf(dxinfox[ channum ].msg_name, "%s/new/%d.pcm", filetmp[channum], anncnum[ channum ]);
+                        // For voicemail
+                        while (errcnt[ channum ] == 1) {
+                            sprintf(dxinfox[ channum ].msg_name, "%s/new/%d.pcm", filetmp[channum], anncnum[ channum ]);
 
-                        if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
-                            errcnt[ channum ] = 0;
-                        } else {
-                            anncnum[ channum ]++;
+                            if (stat(dxinfox[ channum ].msg_name, &sts) == -1) {
+                                errcnt[ channum ] = 0;
+                            } else {
+                                anncnum[ channum ]++;
+                            }
                         }
-                    }
 
-                    sprintf(filetmp3[channum], "%s/new/%d.atr", filetmp[channum], anncnum[channum]);
-                    resumefile[channum] = fopen(filetmp3[channum], "w+");
-                    sprintf(filetmp[channum], "%s", filetmp2[channum]);  // This is sloppy. Sloppy, sloppy, sloppy. Sorry.
-                }
+                        sprintf(filetmp3[channum], "%s/new/%d.atr", filetmp[channum], anncnum[channum]);
+                        resumefile[channum] = fopen(filetmp3[channum], "w+");
+                        sprintf(filetmp[channum], "%s", filetmp2[channum]);  // This is sloppy. Sloppy, sloppy, sloppy. Sorry.
+                    }
 
                 if (rename(filetmp[ channum ], dxinfox[ channum ].msg_name) == 0) {
                     anncnum[ channum ] = 0;
                     errcnt[ channum ] = 0;
 
                     if (dxinfox[ channum ].state == ST_EMREC2) {
-                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/message_sent.vox");
                         dxinfox[ channum ].state = ST_EMPLAY3; // This will take us back to the main menu.
-                        dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
+                        dxinfox[ channum ].msg_fd = open("sounds/emtanon/message_sent.vox", O_RDONLY);
+
+                        if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
+                            disp_msg("...shit, the BBS message sent recording is broke");
+                            file_error( channum, "sounds/emtanon/message_sent.vox" );
+                            return (errcode[channum]);
+                        }
+                    } else if ((dxinfox[ channum ].state == ST_DCBBSREC2) || (dxinfox[ channum ].state == ST_TC24BBSREC3)) {
+                        disp_msgf("File saved as %s", dxinfox[ channum ].msg_name);
+                        dxinfox[ channum ].state = ST_TC24MENU2; // This will take us back to the main menu.
+                        dxinfox[ channum ].msg_fd = open("sounds/emtanon/message_sent.vox", O_RDONLY);
 
                         if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 0, 0, 0)) == -1) {
                             disp_msg("...shit, the BBS message sent recording is broke");
@@ -13085,21 +14101,13 @@ int getdig_hdlr() {
                         if ((errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)) == -1) {
                             disp_msg("...shit, the VMS message sent recording is broke");
                             file_error( channum, "sounds/vmail/messagesent.pcm" );
-                            return (errcode[channum]);
+                            return errcode[channum];
                         }
                     }
 
-                    /* // I think the commented statement below is redundant. I left it here just in case it isn't.
-                    if (errcode[channum] < 0) {
-                       disp_msg( "Fuuuuuck, we got caught with our pants down! Message rename failed." );
-                       dxinfox[channum].state = ST_GOODBYE;
-                       play( channum, errorfd, 0, 0 );
-                       return(-1);
-                    }
-                    */
                 }
 
-                return (0);
+                return 0;
             }
 
             else {
@@ -13107,10 +14115,18 @@ int getdig_hdlr() {
                 close(dxinfox[ channum ].msg_fd);
                 errcnt[ channum ]++;
 
-                if (dxinfox[ channum ].state == ST_EMREC2) {
-                    dxinfox[ channum ].state = ST_EMREC3;
-                } else {
-                    dxinfox[ channum ].state = ST_VMAIL5;
+                switch(dxinfox[ channum ].state) {
+                    case ST_EMREC2:
+                        dxinfox[ channum ].state = ST_EMREC3;
+                        break;
+                    case ST_DCBBSREC2:
+                        dxinfox[ channum ].state = ST_DCBBSREC3;
+                        break;
+                    case ST_TC24BBSREC3:
+                        dxinfox[ channum ].state = ST_TC24BBSREC4;
+                        break;
+                    default:
+                        dxinfox[ channum ].state = ST_VMAIL5;
                 }
 
                 if (play(channum, invalidfd, 0, 0, 0) == -1) {
@@ -13226,6 +14242,8 @@ int getdig_hdlr() {
                 errcnt[channum] = 0;
 
                 if (msgnum[channum] == 255) {
+                    dxinfox[ channum ].state = ST_GOODBYE;
+                    play(channum, errorfd, 0, 0, 0);
                     return -1;    // Temporary file queue is full. Something isn't working right. Let's stop.
                 }
 
@@ -13398,7 +14416,7 @@ int getdig_hdlr() {
 
                 return (errcode[channum]);
             }
-
+    #ifndef ALTOPTS
             if (strcmp("9", dxinfox[ channum ].digbuf.dg_value) == 0) {
                 close(dxinfox[ channum ].msg_fd);
                 errcnt[ channum ] = 0;
@@ -13419,7 +14437,7 @@ int getdig_hdlr() {
                 connchan[connchan[channum]] = channum;
 
                 if (altsig & 4) {
-                    if (!fprintf(calllog, "%s;Voice BBS Mitel Outdial;Outgoing CPN %s;In channel %d;Out channel %d\n", timeoutput(channum), dm3board ? config.defaultcpn : config.origtestcpn, channum, connchan[channum])) {
+                    if (!fprintf(calllog, "%s;Random Toll-free Outdial;Outgoing CPN %s;In channel %d;Out channel %d\n", timeoutput(channum), dm3board ? config.defaultcpn : config.origtestcpn, channum, connchan[channum])) {
                         disp_msg("Failed to log");
                     }
 
@@ -13449,12 +14467,100 @@ int getdig_hdlr() {
                 dxinfox[ channum ].state = ST_ROUTED;
                 return (0);
             }
+        #else
+            if (strcmp("9", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                close(dxinfox[ channum ].msg_fd);
+                errcnt[ channum ] = 0;
 
+                if (dx_clrdigbuf(dxinfox[channum].chdev) == -1) {     // Since we don't need the digit buffer anymore, let's clear it; other things might need it.
+                    disp_msgf("Cannot clear DTMF Buffer for %s", ATDV_NAMEP(dxinfox[channum].chdev));
+                }
+
+                // connchan[ channum ] = 1;
+
+                connchan[ channum ] = idle_trunkhunt( channum, 1, 23, false );
+                if (connchan[ channum ] == -1) return -1;
+
+                // Trunkhunt replacement
+
+                connchan[connchan[channum]] = channum;
+
+                if (altsig & 4) {
+                    if (!fprintf(calllog, "%s;Voice BBS Fax Outdial;In channel %d;Out channel %d\n", timeoutput(channum), channum, connchan[channum])) {
+                        disp_msg("Failed to log");
+                    }
+
+                    fflush(calllog);
+                }
+
+
+                makecall(connchan[channum], "9522116", dm3board ? config.defaultcpn : config.origtestcpn, FALSE);
+
+                dxinfox[ channum ].state = ST_ROUTED;
+                return (0);
+            }
+
+            if (strcmp("0", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                close(dxinfox[ channum ].msg_fd);
+                errcnt[ channum ] = 0;
+
+                if (dx_clrdigbuf(dxinfox[channum].chdev) == -1) {     // Since we don't need the digit buffer anymore, let's clear it; other things might need it.
+                    disp_msgf("Cannot clear DTMF Buffer for %s", ATDV_NAMEP(dxinfox[channum].chdev));
+                }
+
+                // connchan[ channum ] = 1;
+
+                connchan[ channum ] = idle_trunkhunt( channum, 1, 23, false );
+                if (connchan[ channum ] == -1) return -1;
+
+                // Trunkhunt replacement
+
+                connchan[connchan[channum]] = channum;
+
+                if (altsig & 4) {
+                    if (!fprintf(calllog, "%s;Voice BBS Touchtone Game Outdial;In channel %d;Out channel %d\n", timeoutput(channum), channum, connchan[channum])) {
+                        disp_msg("Failed to log");
+                    }
+
+                    fflush(calllog);
+                }
+
+
+                makecall(connchan[channum], "9522113", dm3board ? config.defaultcpn : config.origtestcpn, FALSE);
+
+                dxinfox[ channum ].state = ST_ROUTED;
+                return (0);
+            }
+
+        #endif
+
+        #ifndef ALTOPTS
             if (strcmp("5", dxinfox[ channum ].digbuf.dg_value) == 0) {
                 close(dxinfox[ channum ].msg_fd);
                 errcnt[ channum ] = 0;
                 return conf_init(channum, 0, 0);
             }
+        #else
+        // On some systems, the outgoing call goes to a Mitel PBX. For... science.
+            if (strcmp("5", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                close(dxinfox[ channum ].msg_fd);
+                errcnt[ channum ] = 0;
+                connchan[ channum ] = idle_trunkhunt( channum, 1, 23, false );
+                if (connchan[ channum ] == -1) return -1;
+                connchan[connchan[channum]] = channum;
+                if (altsig & 4) {
+                    if (!fprintf(calllog, "%s;Voice BBS Mitel Outdial;Outgoing CPN %s;In channel %d;Out channel %d\n", timeoutput(channum), dm3board ? config.defaultcpn : config.origtestcpn, channum, connchan[channum])) {
+                        disp_msg("Failed to log");
+                    }
+
+                    fflush(calllog);
+                }
+                makecall(connchan[channum], "725555", dm3board ? config.defaultcpn : config.origtestcpn, FALSE);
+                dxinfox[ channum ].state = ST_ROUTED;
+                return 0;
+            }
+
+        #endif
 
 
             if ((strcmp("6", dxinfox[ channum ].digbuf.dg_value) == 0) && (ownies[channum] == 100)) {
@@ -13494,10 +14600,21 @@ int getdig_hdlr() {
                 return (0);
             }
 
-            if ((strcmp("*", dxinfox[ channum ].digbuf.dg_value) == 0) && (ownies[channum] == 100)) {
-                dxinfox[ channum ].state = ST_TXDATA;
-                playtone_cad(channum, 440, 0, 33);
-                return (0);
+            if (strcmp("*", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                close(dxinfox[ channum ].msg_fd);
+                errcnt[ channum ] = 0;
+                dx_clrdigbuf(dxinfox[channum].chdev);
+                dxinfox[ channum ].state = ST_TC24MENU;
+                // Zero this out, just in case.
+                memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                errcnt[ channum ] = 0;
+                disp_status(channum, "Running Telechallenge IVR");
+                dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                    file_error( channum, "sounds/tc24/greeting.pcm" );
+                    return -1;
+                }
+                return 0;
             }
 
             if ((strcmp("E", dxinfox[ channum ].digbuf.dg_value) == 0) && (ownies[channum] == 100)) {
@@ -14796,6 +15913,9 @@ int getdig_hdlr() {
                 break; //We'll finish this up later.
             }
 
+        case ST_TC24BBS2:
+        case ST_DCBBS:
+        case ST_TCTUTORIAL:
         case ST_EMPLAY2:
         case ST_DYNPLAY:
             if (strcmp("1", dxinfox[ channum ].digbuf.dg_value) == 0) {
@@ -14803,10 +15923,21 @@ int getdig_hdlr() {
                 playoffset[ channum ] = 0;
                 dx_adjsv(dxinfox[ channum ].chdev, SV_VOLUMETBL, SV_ABSPOS, 0);   // Reset volume to normal
 
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -14828,12 +15959,22 @@ int getdig_hdlr() {
                     if (anncnum[ channum ] <= minannc[ channum ]) {
                         anncnum[ channum ] = (minannc[ channum ] + 1);
 
-                        if (dxinfox[ channum ].state == ST_DYNPLAY) {
+                    switch(dxinfox[ channum ].state) {
+                        case ST_DYNPLAY:
                             sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                        } else {
+                            break;
+                        case ST_TCTUTORIAL:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                            break;
+                        case ST_DCBBS:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                            break;
+                        case ST_TC24BBS2:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                            break;
+                        default:
                             sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                         }
-
                         dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
                         errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
                     }
@@ -14846,11 +15987,21 @@ int getdig_hdlr() {
                 anncnum[ channum ]++;
                 playoffset[ channum ] = 0;
                 dx_adjsv(dxinfox[ channum ].chdev, SV_VOLUMETBL, SV_ABSPOS, 0);   // Reset volume to normal
-
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -14871,9 +16022,20 @@ int getdig_hdlr() {
                     if (anncnum[ channum ] >= maxannc[ channum ]) {
                         anncnum[ channum ] = (maxannc[ channum ] - 1);
 
-                        if (dxinfox[ channum ].state == ST_DYNPLAY) {
+                    switch(dxinfox[ channum ].state) {
+                        case ST_DYNPLAY:
                             sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                        } else {
+                            break;
+                        case ST_TCTUTORIAL:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                            break;
+                        case ST_DCBBS:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                            break;
+                        case ST_TC24BBS2:
+                            sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                            break;
+                        default:
                             sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                         }
 
@@ -14886,10 +16048,21 @@ int getdig_hdlr() {
             }
 
             if (strcmp("4", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -14933,28 +16106,47 @@ int getdig_hdlr() {
 
                     // TO DO: This error happens since dx_addtone() keeps getting invoked inappropriately; we should be adding the tone when we come into the voice BBS, and only enabling it here.
 
-                    if (dx_enbtone(chdev, TID_1, DM_TONEON) == -1) {
-                        disp_msgf("Unable to enable Chucktone.");
+                    if (dx_enbtone(dxinfox[channum].chdev, TID_1, DM_TONEON) == -1) {
+                        disp_msgf("Unable to enable Chucktone, error %s", ATDV_ERRMSGP(dxinfox[channum].chdev));
                     }
 
                     termmask[channum] |= 1;
-                    ownies[channum] = 100;
 
                 }
 
                 // If the Chucktone doesn't work, just keep going.
-
+                ownies[channum] = 100;
                 dxinfox[ channum ].msg_fd = open("sounds/emtanon/greeting_new.pcm", O_RDONLY);
+                errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
+                return (errcode[channum]);
+            }
+
+            else if ((strcmp("5", dxinfox[ channum ].digbuf.dg_value) == 0) && ((dxinfox[ channum ].state == ST_TCTUTORIAL) || (dxinfox[ channum ].state == ST_DCBBS) || (dxinfox[ channum ].state == ST_TC24BBS2)) ) {
+                anncnum[ channum ] = 0;
+                errcnt[ channum ] = 0;
+                dxinfox[ channum ].state = ST_TC24MENU;
+                dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
                 errcode[channum] = play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0);
                 return (errcode[channum]);
             }
 
             // TO DO: Revise this code. Pretty please. It hurts to look at.
             if (strcmp("6", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -15004,10 +16196,21 @@ int getdig_hdlr() {
             }
 
             if (strcmp("7", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -15031,10 +16234,21 @@ int getdig_hdlr() {
             }
 
             if (strcmp("8", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -15058,10 +16272,21 @@ int getdig_hdlr() {
             }
 
             if (strcmp("9", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                if (dxinfox[ channum ].state == ST_DYNPLAY) {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
-                } else {
-                    sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
+                switch(dxinfox[ channum ].state) {
+                    case ST_DYNPLAY:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TCTUTORIAL:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/tutorial/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_DCBBS:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/dcbbs/%d.pcm", anncnum[channum]);
+                        break;
+                    case ST_TC24BBS2:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/tc24/bbs/%d.pcm", anncnum[channum]);
+                        break;
+                    default:
+                        sprintf(dxinfox[ channum ].msg_name, "sounds/emtanon/%d.pcm", anncnum[channum]);
                 }
 
                 errcode[channum] = dxinfox[ channum ].msg_fd = open(dxinfox[ channum ].msg_name, O_RDONLY);
@@ -16145,8 +17370,6 @@ int playtone_hdlr() {
                 disp_msgf("DTMF collect error: %s", ATDV_ERRMSGP(chdev));
             }
 
-            //dxinfox[ channum ].state = ST_GETDIGIT;
-
             break;
 
         case ST_OUTDIAL:
@@ -16923,10 +18146,6 @@ void sysinit() {
     /*
      * Open VOX Files
      */
-    if ((introfd = open(INTRO_VOX, O_RDONLY)) == -1) {
-        disp_msgf("Cannot open %s", INTRO_VOX);
-        QUIT(2);
-    }
 
     if ((invalidfd = open(INVALID_VOX, O_RDONLY)) == -1) {
         disp_msgf("Cannot open %s", INVALID_VOX);
@@ -16943,14 +18162,21 @@ void sysinit() {
         QUIT(2);
     }
 
+    // TO DO: Make an execution flag/config option for these to be optional.
+
     if (sqlite3_open("activation.db", &activationdb) != SQLITE_OK) {
         disp_msgf("Cannot open database scdp_peers.db");
         QUIT(2);
     }
 
+    if (sqlite3_open("tc.db", &tc_blacklist) != SQLITE_OK) {
+        disp_msgf("Cannot open database tc.db");
+        QUIT(2);
+    }
+
     /*
-     * Clear the dxinfo structure.
-     * Initialize Channel States to Detect Call.
+     * Clear the dxinfo structure, parse config file.
+     * Initialize channel states to start boards/protocols as necessary
      */
     memset(&dxinfox, 0x00, (sizeof(DX_INFO_Y) * (MAXCHANS + 1)));
 

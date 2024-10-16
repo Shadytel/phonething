@@ -32,6 +32,7 @@ typedef struct {
                 char music[CONFIG_MAX_EXTEN];
                 char altconf[CONFIG_MAX_EXTEN];
                 char projectupstage[CONFIG_MAX_EXTEN];
+                char telechallenge[CONFIG_MAX_EXTEN];
 
                 char callintercept[CONFIG_MAX_EXTEN];
         } extensions;
@@ -45,6 +46,7 @@ typedef struct {
         char provisiondn[CONFIG_MAX_EXTEN];
         char altprovisiondn[CONFIG_MAX_EXTEN];
         char interceptdest[CONFIG_MAX_EXTEN];
+        char dialout_prefix[CONFIG_MAX_EXTEN];
 
         char login[CONFIG_MAX_EXTEN];
         char password[CONFIG_MAX_EXTEN];

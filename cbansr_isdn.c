@@ -119,6 +119,7 @@ int get_digs(short channum, DV_DIGIT *digbufp, unsigned short numdigs, unsigned 
 char set_bearer (short channum, char bearer);
 char progress_writesig(unsigned char offset, short channum);
 int playtone_rep(short channum, int toneval, int toneval2, int amp1, int amp2, int ontime, int pausetime);
+void outcall_inroute(short channum);
 
 void config_successhdlr() {
     int ldev = sr_getevtdev();
@@ -754,6 +755,11 @@ char isdn_connecthdlr() {
         return (0);
     }
 
+    if (dxinfox[ channum ].state == ST_OUTCALLTEST) {
+        outcall_inroute(channum);
+        return 0;
+    }
+
     if (dxinfox[ channum ].state == ST_CONFOUT) {
         addtoconf(channum, 0); // For now, let's just assume the conference we're adding it to is the general one
         return 0;
@@ -926,6 +932,7 @@ char isdn_progressing() {
     disp_status(channum, tmpbuff);
 
     // Perform cut-through
+    if (dxinfox[channum].state == ST_OUTCALLTEST) return 0; // Stop the software from trying to bridge calls to non-existent channels
 
     if (!((dxinfox[ channum ].state == ST_CALLPTEST4) || (dxinfox[ channum ].state == ST_CALLPTEST5))) {
         // Instead of performing timeslot routing operations, activate call progress detection for dialer mode
@@ -1033,7 +1040,12 @@ char makecall(short channum, char *destination, char *callingnum, char rec) {
 
     int callstate;
 
-    if ((dxinfox[ channum ].state != ST_CALLPTEST4) &&
+    if (dxinfox[ channum ].state == ST_OUTCALLTEST) {
+        cutthrough[channum] = 1; // Never try to cut an unattached DSP object through
+    }
+
+
+    else if ((dxinfox[ channum ].state != ST_CALLPTEST4) &&
             (dxinfox[ channum ].state != ST_CALLPTEST5) &&  // && <cr> and add more states here if needed
             (dxinfox[ channum ].state != ST_2600ROUTE2)
        ) {
@@ -2633,23 +2645,30 @@ int isdn_offerhdlr()
         gc_errprint("gc_GetCallInfo_dnis", channum, -1);
     }
 
-    else {
-        sprintf(tmpbuff, "Incoming dest. is %s", isdninfo[channum].dnis);
-        disp_msg(tmpbuff);
-    }
-
     // If there's no CPN, this function will return an error on Springware boards
     // DM3 boards, however, will just silently keep on going.
     if (gc_GetCallInfo(port[channum].crn, ORIGINATION_ADDRESS, &(isdninfo[channum].cpn[0])) != GC_SUCCESS) {
-        disp_msg("gc_GetCallInfo() error!");
+        disp_msg("Error getting CPN!");
         gc_errprint("gc_GetCallInfo_cpn", channum, -1);
-        sprintf(isdninfo[channum].cpn, "631");
+        sprintf(isdninfo[channum].cpn, "702");
     }
 
     else {
-        if (strlen(isdninfo[channum].cpn) > 0) {
-            sprintf(tmpbuff, "Incoming CPN is %s", isdninfo[channum].cpn);
-            disp_msg(tmpbuff);
+        // Is there a + as the first character?
+        unsigned short length = strlen(isdninfo[channum].cpn);
+        if (length == 1) isdninfo[channum].cpn[0] = 0x30;
+        if (length > 1) {
+            if (isdninfo[channum].cpn[0] == '+') {
+                unsigned short counter;
+                for (counter = 0; counter < length; counter++) {
+                    isdninfo[channum].cpn[counter] = isdninfo[channum].cpn[counter + 1];
+                }
+            }
+
+            // Stupid media gateways call for stupid solutions!
+            else if (strcmp("Anonymous", isdninfo[channum].cpn) == 0) {
+                sprintf(isdninfo[channum].cpn, "702");
+            }
         }
 
         // To do: use snprintf to truncate this if it's too long. Read some specs and see what flavor allows the longest destination.
@@ -3066,3 +3085,28 @@ int isdn_open(int maxchan) {
     return (0);
 }
 
+void isdn_close(int channum) {
+
+    //for(int counter = 0; counter < maxchan; counter++) {
+        if (channum % 24 == 0) return;
+        int callstate;
+        if (gc_GetCallState(port[ channum ].crn, &callstate) == GC_SUCCESS)
+            disp_msgf("DEBUG: callstate for channel %d is %d", channum, callstate);
+        else disp_msgf("DEBUG: Couldn't get call state for channel %d", channum);
+        /*
+        if (gc_SetChanState(port[ channum ].ldev, GCLS_OUT_OF_SERVICE, EV_SYNC) != GC_SUCCESS) {
+            disp_msg("ERROR: gc_SetChanState failed!");
+            gc_errprint("gc_SetChanState", port[channum].ldev, 0);
+        }
+        */        
+        if (gc_ResetLineDev(port[channum].ldev, EV_SYNC) != GC_SUCCESS) {
+            disp_msg("ERROR: Couldn't reset line device!");
+        }
+
+        if (gc_Close(port[ channum ].ldev) != GC_SUCCESS) {
+            disp_msg("ERROR: gc_Close failed!");
+            gc_errprint("gc_Close", port[channum].ldev, 0);
+        }
+    //}
+    return;
+}

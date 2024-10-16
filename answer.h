@@ -2,7 +2,7 @@
  ** Definitions
  **/
 #define MAXCHANS    96  /* Maximum Number of Channels       */
-#define MAXRING     2   /* Number of Rings Before Picking Up    */
+#define MAXRING     2   /* Number of Rings Before Picking Up On Analog Cards   */
 #define MAXMSG      260 /* Maximum Length of Message Filename. So, *so* wasteful... */
 #define FALSE       0
 #define TRUE        1
@@ -34,9 +34,8 @@ char isdnstatus[ MAXCHANS + 1 ];
 char filetmp[ MAXCHANS + 1 ][ MAXMSG + 1 ];
 char filetmp2[ MAXCHANS + 1 ][ MAXMSG + 1 ];
 short connchan[MAXCHANS + 1];
-int errorfd;
-int invalidfd;
-int multiplay[MAXCHANS + 1][6];
+int errorfd, invalidfd;
+int multiplay[MAXCHANS + 1][12];
 unsigned char participants[2];
 int altsig; /* For winkstart operation or echo cancellation */
 short loopchan;
@@ -102,7 +101,6 @@ Q931SIG isdninfo[ MAXCHANS + 1];
 #define ST_WTRING   1   /* Waiting for an Incoming Call    */
 #define ST_OFFHOOK  2   /* Going Off Hook to Accept Call   */
 #define ST_INTRO    3   /* Play the intro.vox File         */
-#define ST_GETDIGIT 4   /* Get DTMF Digits (Access Code)   */
 #define ST_PLAY     5   /* Play the Caller's Message File  */
 #define ST_RECORD   6   /* Recording Message from Caller   */
 #define ST_INVALID  7   /* Play invalid.vox (Invalid Code) */
@@ -296,6 +294,34 @@ Q931SIG isdninfo[ MAXCHANS + 1];
 #define ST_ADMINADD3E       194
 #define ST_LOOP1            195
 #define ST_LOOP2            196
+#define ST_TC24MENU         197
+#define ST_TC24MENUE        198
+#define ST_TC24MENU1        199
+#define ST_TC24MENU1E       200
+#define ST_TC24MENU2        201
+#define ST_TC24CALL         202
+#define ST_TC24CALLE        203
+#define ST_TC24CALL2        204
+#define ST_TC24CALL2E       205
+#define ST_TC24CALLCONF     206
+#define ST_TC24CALLCONFE    207
+#define ST_TC24BBS          208
+#define ST_TC24BBSE         209
+#define ST_TC24BBSREC       210
+#define ST_TC24BBSRECE      211
+#define ST_TC24ARG          212
+#define ST_TCTUTORIAL       213
+#define ST_TC24BBS2         214
+#define ST_TC24BBSREC2      215
+#define ST_TC24BBSREC3      216
+#define ST_TC24BBSREC4      217
+#define ST_DCBBS            218
+#define ST_DCBBSREC         219
+#define ST_DCBBSREC2        220
+#define ST_DCBBSREC3        221
+#define ST_OUTCALLTEST      222
+#define ST_TC24CALLDB       223
+
 /*
  * Macros
  */

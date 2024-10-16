@@ -82,6 +82,7 @@ void config_load_defaults(configuration_t* dest) {
     strncpy(dest->provisiondn, "3913", CONFIG_MAX_EXTEN);
     strncpy(dest->altprovisiondn, "3914", CONFIG_MAX_EXTEN);
     strncpy(dest->interceptdest, "3000", CONFIG_MAX_EXTEN);
+    strncpy(dest->dialout_prefix, "15*", CONFIG_MAX_EXTEN);
 
     strncpy(dest->login, "71106", CONFIG_MAX_EXTEN);
     strncpy(dest->password, "5032970070", CONFIG_MAX_EXTEN);
@@ -153,6 +154,8 @@ static bool config_parse_line(const char* line, configuration_t* dest) {
         valueDest = &(dest->extensions.phreakspots);
     } else if (!strncmp(line, "projectupstage", keyLen)) {
         valueDest = &(dest->extensions.projectupstage);
+    } else if (!strncmp(line, "telechallenge", keyLen)) {
+        valueDest = &(dest->extensions.telechallenge);
     } else if (!strncmp(line, "callintercept", keyLen)) {
         valueDest = &(dest->extensions.callintercept);
     } else if (!strncmp(line, "anac", keyLen)) {
@@ -165,6 +168,8 @@ static bool config_parse_line(const char* line, configuration_t* dest) {
         valueDest = &(dest->dialersound);
     } else if (!strncmp(line, "origtestcpn", keyLen)) {
         valueDest = &(dest->origtestcpn);
+    } else if (!strncmp(line, "dialout_prefix", keyLen)) {
+        valueDest = &(dest->dialout_prefix);
     } else if (!strncmp(line, "interceptdest", keyLen)) {
         valueDest = &(dest->interceptdest);
     } else if (!strncmp(line, "login", keyLen)) {
@@ -286,6 +291,7 @@ void config_dump(const configuration_t *conf) {
     printf("dialersound: %s\n", conf->dialersound);
     printf("provisiondn: %s\n", conf->provisiondn);
     printf("altprovisiondn: %s\n", conf->altprovisiondn);
+    printf("dialout_prefix: %s\n", conf->dialout_prefix);
 
     printf("interceptdest: %s\n", conf->interceptdest);
 

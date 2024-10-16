@@ -7,9 +7,7 @@
 #include <srllib.h>
 #include <scroute.h>
 #include <dxxxlib.h>
-#ifdef DTISC
-    #include <dtilib.h>
-#endif
+#include <dtilib.h>
 #ifdef MSISC
     #include <msilib.h>
 #endif
@@ -78,7 +76,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
       }
       break;
 
-#ifdef DTISC
    case SC_DTI:
       if (dt_getxmitslot(devh1, &sc_tsinfo) == -1) {
          nr_scerror("nr_scroute: %s: dt_getxmitslot ERROR: %s\n",
@@ -86,7 +83,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
          return -1;
       }
       break;
-#endif
 
 #ifdef MSISC
    case SC_MSI:
@@ -158,7 +154,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
       }
       break;
 
-#ifdef DTISC
    case SC_DTI:
       if (dt_listen(devh2, &sc_tsinfo) == -1) {
          nr_scerror("nr_scroute: %s: Cannot dt_listen %d ERROR: %s\n",
@@ -176,7 +171,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
          return -1;
       }
       break;
-#endif
 
 #ifdef MSISC
    case SC_MSI:
@@ -245,7 +239,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
       }
       break;
 
-#ifdef DTISC
    case SC_DTI:
       if (dt_listen(devh1, &sc_tsinfo) == -1) {
          nr_scerror("nr_scroute: %s: Cannot dt_listen %d ERROR: %s\n",
@@ -253,7 +246,6 @@ int nr_scroute( devh1, devtype1, devh2, devtype2, mode )
          return -1;
       }
       break;
-#endif
 
 #ifdef MSISC
    case SC_MSI:
@@ -327,7 +319,6 @@ int nr_scunroute( devh1, devtype1, devh2, devtype2, mode )
       }
       break;
 
-#ifdef DTISC
    case SC_DTI:
       if (dt_unlisten(devh2) == -1) {
          nr_scerror("nr_scunroute: %s: dt_unlisten ERROR: %s\n",
@@ -335,7 +326,6 @@ int nr_scunroute( devh1, devtype1, devh2, devtype2, mode )
          rc = -1;
       }
       break;
-#endif
 
 #ifdef MSISC
    case SC_MSI:
@@ -391,7 +381,6 @@ int nr_scunroute( devh1, devtype1, devh2, devtype2, mode )
       }
       break;
 
-#ifdef DTISC
    case SC_DTI:
       if (dt_unlisten(devh1) == -1) {
          nr_scerror("nr_scunroute: %s: dt_unlisten ERROR: %s\n",
@@ -399,7 +388,6 @@ int nr_scunroute( devh1, devtype1, devh2, devtype2, mode )
          rc = -1;
       }
       break;
-#endif
 
 #ifdef MSISC
    case SC_MSI:
