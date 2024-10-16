@@ -52,6 +52,8 @@ typedef struct {
         char password[CONFIG_MAX_EXTEN];
 
         bool cnetintercept;
+        bool telechallenge;
+        bool activationsys;
 
         configuration_range_t analog_channels;
         configuration_range_t isdn_channels;

@@ -88,6 +88,8 @@ void config_load_defaults(configuration_t* dest) {
     strncpy(dest->password, "5032970070", CONFIG_MAX_EXTEN);
 
     dest->cnetintercept = true;
+    dest->telechallenge = false;
+    dest->activationsys = false;
 }
 
 static bool config_parse_line(const char* line, configuration_t* dest) {
@@ -182,6 +184,12 @@ static bool config_parse_line(const char* line, configuration_t* dest) {
         valueDest = &(dest->altprovisiondn);
     } else if (!strncmp(line, "cnetintercept", keyLen)) {
         valueDest = &(dest->cnetintercept);
+        valueType = BOOLEAN;
+    } else if (!strncmp(line, "telechallenge", keyLen)) {
+        valueDest = &(dest->telechallenge);
+        valueType = BOOLEAN;
+    } else if (!strncmp(line, "activationsys", keyLen)) {
+        valueDest = &(dest->activationsys);
         valueType = BOOLEAN;
     } else if (!strncmp(line, "analog", keyLen)) {
         valueDest = &(dest->analog_channels);

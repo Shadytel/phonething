@@ -3600,7 +3600,7 @@ char isdn_inroute(short channum) {
             return (0);
     }
 
-   if ( (strcmp(isdninfo[channum].dnis, config.extensions.telechallenge) == 0) ){
+   if ( (strcmp(isdninfo[channum].dnis, config.extensions.telechallenge) == 0) && (config.telechallenge) ){
          set_hkstate(channum, DX_OFFHOOK);
          dx_clrdigbuf(dxinfox[channum].chdev);
          dxinfox[ channum ].state = ST_TC24MENU;
@@ -3688,22 +3688,23 @@ char isdn_inroute(short channum) {
         return 0;
     }
 
-    if ((strcmp(config.extensions.activation, isdninfo[ channum ].dnis) == 0) || (strcmp(config.extensions.altactivation, isdninfo[ channum ].dnis) == 0)) {
-        // Zero out the filetmp strings
-        memset(filetmp[channum], 0x00, sizeof(filetmp[channum])); // For general SQL queries
-        memset(filetmp2[channum], 0x00, sizeof(filetmp2[channum])); // For outbound provisioning orders
-        //memset(filetmp3[channum], 0x00, sizeof(filetmp3[channum]));
-        disp_statusf(channum, "Running Activation IVR: Ext. %s", isdninfo[channum].cpn);
-        srandom(time(NULL));
-        errcnt[channum] = 0;
-        set_hkstate(channum, DX_OFFHOOK);
-        dxinfox[ channum ].state = ST_ACTIVATION;
-        dxinfox[ channum ].msg_fd = open("sounds/activation/activation_intro.pcm", O_RDONLY);
-        if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)  == -1) {
-            file_error(channum, "sounds/activation/activation_intro.pcm");
-            return -1;
-        }
+    if (config.activationsys) {
+        if ((strcmp(config.extensions.activation, isdninfo[ channum ].dnis) == 0) || (strcmp(config.extensions.altactivation, isdninfo[ channum ].dnis) == 0)) {
+            // Zero out the filetmp strings
+            memset(filetmp[channum], 0x00, sizeof(filetmp[channum])); // For general SQL queries
+            memset(filetmp2[channum], 0x00, sizeof(filetmp2[channum])); // For outbound provisioning orders
+            disp_statusf(channum, "Running Activation IVR: Ext. %s", isdninfo[channum].cpn);
+            srandom(time(NULL));
+            errcnt[channum] = 0;
+            set_hkstate(channum, DX_OFFHOOK);
+            dxinfox[ channum ].state = ST_ACTIVATION;
+            dxinfox[ channum ].msg_fd = open("sounds/activation/activation_intro.pcm", O_RDONLY);
+            if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)  == -1) {
+                file_error(channum, "sounds/activation/activation_intro.pcm");
+                return -1;
+            }
         return 0;
+        }
     }
 
    if ( (strcmp(isdninfo[channum].dnis, config.extensions.music) == 0) ){
@@ -10676,30 +10677,34 @@ int getdig_hdlr() {
                 return (0);
             }
 
-            if (strcmp(config.adminivr, dxinfox[ channum ].digbuf.dg_value) == 0) {
-                    // Admin IVR - Edit
-                    errcnt[channum] = 0;
-                    dxinfox[ channum ].state = ST_ADMINACT;
-                    disp_statusf(channum, "Running Activation Admin IVR: Ext. %s", isdninfo[channum].cpn);
-                    dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
-                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
-                        file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
-                        return -1;
-                    }
-                    return 0;
-            }
+            if (config.activationsys) {
+
+                if (strcmp(config.adminivr, dxinfox[ channum ].digbuf.dg_value) == 0) {
+                        // Admin IVR - Edit
+                        errcnt[channum] = 0;
+                            dxinfox[ channum ].state = ST_ADMINACT;
+                        disp_statusf(channum, "Running Activation Admin IVR: Ext. %s", isdninfo[channum].cpn);
+                        dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
+                            return -1;
+                        }
+                        return 0;
+                }
             
 
-            if (strcmp(config.adminaddivr, dxinfox[ channum ].digbuf.dg_value) == 0) {
-                    errcnt[channum] = 0;
-                    dxinfox[ channum ].state = ST_ADMINADD;
-                    disp_statusf(channum, "Running Activation Admin Add IVR: Ext. %s", isdninfo[channum].cpn);
-                    dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
-                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
-                        file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
-                        return -1;
-                    }
-                    return 0;
+                if (strcmp(config.adminaddivr, dxinfox[ channum ].digbuf.dg_value) == 0) {
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_ADMINADD;
+                        disp_statusf(channum, "Running Activation Admin Add IVR: Ext. %s", isdninfo[channum].cpn);
+                        dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
+                            return -1;
+                        }
+                        return 0;
+                }
+
             }
 
             if (strcmp("3115552368", dxinfox[ channum ].digbuf.dg_value) == 0) {
@@ -14600,22 +14605,26 @@ int getdig_hdlr() {
                 return (0);
             }
 
-            if (strcmp("*", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                close(dxinfox[ channum ].msg_fd);
-                errcnt[ channum ] = 0;
-                dx_clrdigbuf(dxinfox[channum].chdev);
-                dxinfox[ channum ].state = ST_TC24MENU;
-                // Zero this out, just in case.
-                memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
-                errcnt[ channum ] = 0;
-                disp_status(channum, "Running Telechallenge IVR");
-                dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
-                if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
-                    file_error( channum, "sounds/tc24/greeting.pcm" );
-                    return -1;
+            if (config.telechallenge) {
+                if (strcmp("*", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                    close(dxinfox[ channum ].msg_fd);
+                    errcnt[ channum ] = 0;
+                    dx_clrdigbuf(dxinfox[channum].chdev);
+                    dxinfox[ channum ].state = ST_TC24MENU;
+                    // Zero this out, just in case.
+                    memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                    errcnt[ channum ] = 0;
+                    disp_status(channum, "Running Telechallenge IVR");
+                    dxinfox[ channum ].msg_fd = open("sounds/tc24/greeting.pcm", O_RDONLY);
+                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0) == -1) {
+                        file_error( channum, "sounds/tc24/greeting.pcm" );
+                        return -1;
+                    }
+                    return 0;
                 }
-                return 0;
             }
+
+            // TO DO: There should be an else here for something interesting if the Telechallenge IVR is disabled.
 
             if ((strcmp("E", dxinfox[ channum ].digbuf.dg_value) == 0) && (ownies[channum] == 100)) {
 
@@ -16605,56 +16614,57 @@ int getdig_hdlr() {
                     return (0);
                 }
 
-                if (strcmp("2121", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                    // Customer-facing activation IVR
-                    if (altsig & 1) {
-                        set_hkstate(channum, DX_OFFHOOK);
-                    }
-                    memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
-                    disp_statusf(channum, "Running Activation IVR: Ext. %s", isdninfo[channum].cpn);
-                    srandom(time(NULL));
-                    errcnt[channum] = 0;
-                    dxinfox[ channum ].state = ST_ACTIVATION;
-                    dxinfox[ channum ].msg_fd = open("sounds/activation/activation_intro.pcm", O_RDONLY);
-                    if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)  == -1) {
-                        file_error(channum, "sounds/activation/activation_intro.pcm");
-                        return -1;
-                    }
-                    return 0;
+                if (config.activationsys) {
 
-                }
+                    if (strcmp("2121", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                        // Customer-facing activation IVR
+                        if (altsig & 1) {
+                            set_hkstate(channum, DX_OFFHOOK);
+                        }
+                        memset(filetmp[channum], 0x00, sizeof(filetmp[channum]));
+                        disp_statusf(channum, "Running Activation IVR: Ext. %s", isdninfo[channum].cpn);
+                        srandom(time(NULL));
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_ACTIVATION;
+                        dxinfox[ channum ].msg_fd = open("sounds/activation/activation_intro.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[ channum ].msg_fd, 1, 0, 0)  == -1) {
+                            file_error(channum, "sounds/activation/activation_intro.pcm");
+                            return -1;
+                        }
+                        return 0;
+                    }
 
-                if (strcmp("2122", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                    // Admin IVR - Edit
-                    if (altsig & 1) {
-                        set_hkstate(channum, DX_OFFHOOK);
+                    if (strcmp("2122", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                        // Admin IVR - Edit
+                        if (altsig & 1) {
+                            set_hkstate(channum, DX_OFFHOOK);
+                        }
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_ADMINACT;
+                        disp_statusf(channum, "Running Activation Admin IVR: Ext. %s", isdninfo[channum].cpn);
+                        dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
+                            return -1;
+                        }
+                        return 0;
                     }
-                    errcnt[channum] = 0;
-                    dxinfox[ channum ].state = ST_ADMINACT;
-                    disp_statusf(channum, "Running Activation Admin IVR: Ext. %s", isdninfo[channum].cpn);
-                    dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
-                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
-                        file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
-                        return -1;
-                    }
-                    return 0;
 
-                }
-
-                if (strcmp("2123", dxinfox[ channum ].digbuf.dg_value) == 0) {
-                    // Admin IVR - Batch Add
-                    if (altsig & 1) {
-                        set_hkstate(channum, DX_OFFHOOK);
+                    if (strcmp("2123", dxinfox[ channum ].digbuf.dg_value) == 0) {
+                        // Admin IVR - Batch Add
+                        if (altsig & 1) {
+                            set_hkstate(channum, DX_OFFHOOK);
+                        }
+                        errcnt[channum] = 0;
+                        dxinfox[ channum ].state = ST_ADMINADD;
+                        disp_statusf(channum, "Running Activation Admin Add IVR: Ext. %s", isdninfo[channum].cpn);
+                        dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
+                        if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
+                            file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
+                            return -1;
+                        }
+                        return 0;
                     }
-                    errcnt[channum] = 0;
-                    dxinfox[ channum ].state = ST_ADMINADD;
-                    disp_statusf(channum, "Running Activation Admin Add IVR: Ext. %s", isdninfo[channum].cpn);
-                    dxinfox[ channum ].msg_fd = open("sounds/activation/activationivr_admin_enterext.pcm", O_RDONLY);
-                    if (play(channum, dxinfox[channum].msg_fd, 1, 0, 0) != 0) {
-                        file_error(channum, "sounds/activation/activationivr_admin_enterext.pcm");
-                        return -1;
-                    }
-                    return 0;
 
                 }
 
@@ -18164,15 +18174,7 @@ void sysinit() {
 
     // TO DO: Make an execution flag/config option for these to be optional.
 
-    if (sqlite3_open("activation.db", &activationdb) != SQLITE_OK) {
-        disp_msgf("Cannot open database scdp_peers.db");
-        QUIT(2);
-    }
 
-    if (sqlite3_open("tc.db", &tc_blacklist) != SQLITE_OK) {
-        disp_msgf("Cannot open database tc.db");
-        QUIT(2);
-    }
 
     /*
      * Clear the dxinfo structure, parse config file.
@@ -18181,6 +18183,20 @@ void sysinit() {
     memset(&dxinfox, 0x00, (sizeof(DX_INFO_Y) * (MAXCHANS + 1)));
 
     confparse();
+
+    if (config.telechallenge) {
+        if (sqlite3_open("tc.db", &tc_blacklist) != SQLITE_OK) {
+            disp_msgf("Cannot open database tc.db");
+            QUIT(2);
+        }
+    }
+
+    if (config.activationsys) {
+        if (sqlite3_open("activation.db", &activationdb) != SQLITE_OK) {
+            disp_msgf("Cannot open database scdp_peers.db");
+            QUIT(2);
+        }
+    }
 
     if (frontend == CT_GCISDN) {
 
